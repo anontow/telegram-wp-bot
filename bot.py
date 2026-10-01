@@ -45,7 +45,6 @@ def create_wordpress_post(title, content, meta_desc="", focus_kw="", slug="", ca
     }
 
     if slug:
-        # Clean slug
         slug = slug.strip().strip("/")
         data["slug"] = slug
 
@@ -100,11 +99,14 @@ def parse_article(text: str):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show category buttons when /start is pressed."""
+    # Clear any previous collected messages
+    context.user_data.clear()
+
     keyboard = []
     row = []
     for cat_id, cat_name in CATEGORIES.items():
         row.append(InlineKeyboardButton(cat_name, callback_data=f"cat_{cat_id}"))
-        if len(row) == 2:  # 2 buttons per row
+        if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
@@ -126,43 +128,76 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat_id = int(query.data.split("_")[1])
     cat_name = CATEGORIES.get(cat_id, "Unknown")
 
-    # Save selected category in user context
+    # Save selected category and prepare to collect messages
     context.user_data["selected_category"] = cat_id
     context.user_data["selected_category_name"] = cat_name
+    context.user_data["collected_parts"] = []  # Store all pasted pieces
+
+    # Done button
+    done_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Done – Post Now", callback_data="done_post")]
+    ])
 
     await query.edit_message_text(
         f"✅ Category selected: **{cat_name}**\n\n"
-        f"Now paste your full article.\n\n"
-        f"Format:\n"
-        f"• Start with <h1>Title</h1>\n"
-        f"• Full HTML content\n"
-        f"• At the bottom:\n"
-        f"  Focus keyword: ...\n"
-        f"  Suggested slug: /...\n"
-        f"  Meta description: ...",
+        f"Now paste your full article.\n"
+        f"(You can paste long text – Telegram may split it into several messages)\n\n"
+        f"When you finish pasting, tap the button below.",
         parse_mode="Markdown",
+        reply_markup=done_keyboard,
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect message pieces until user taps Done."""
     message = update.message
     if not message or not message.text:
         return
 
-    # Check if user has selected a category
     category_id = context.user_data.get("selected_category")
-    category_name = context.user_data.get("selected_category_name", "None")
-
     if not category_id:
         await message.reply_text(
-            "⚠️ Please click /start first and select a category before pasting the article."
+            "⚠️ Please click /start first and select a category."
         )
         return
 
-    text = message.text.strip()
+    # Add this message to the collected parts
+    if "collected_parts" not in context.user_data:
+        context.user_data["collected_parts"] = []
 
-    # Parse the article
-    title, content, focus_kw, meta_desc, slug = parse_article(text)
+    context.user_data["collected_parts"].append(message.text)
+
+    # Just confirm silently (no need to reply every time to avoid spam)
+    # Optional: you can uncomment the line below if you want feedback
+    # await message.reply_text("📄 Part received...")
+
+
+async def done_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Combine all collected parts and create the post."""
+    query = update.callback_query
+    await query.answer()
+
+    category_id = context.user_data.get("selected_category")
+    category_name = context.user_data.get("selected_category_name", "None")
+    parts = context.user_data.get("collected_parts", [])
+
+    if not category_id:
+        await query.edit_message_text("⚠️ No category selected. Please click /start again.")
+        return
+
+    if not parts:
+        await query.edit_message_text(
+            "⚠️ No article received yet.\nPlease paste your article first, then tap Done."
+        )
+        return
+
+    # Combine all parts into one full text
+    full_text = "\n".join(parts)
+
+    await query.edit_message_text(f"⏳ Creating pending post in **{category_name}**...", parse_mode="Markdown")
+
+    # Parse the full article
+    title, content, focus_kw, meta_desc, slug = parse_article(full_text)
 
     # Collect missing fields warnings
     warnings = []
@@ -177,9 +212,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if warnings:
         warning_text = "⚠️ Missing fields:\n" + "\n".join(warnings) + "\n\nStill creating the post..."
-        await message.reply_text(warning_text)
-    else:
-        await message.reply_text(f"⏳ Creating pending post in **{category_name}**...", parse_mode="Markdown")
+        await query.message.reply_text(warning_text)
 
     # Create the post
     success, result = create_wordpress_post(
@@ -192,9 +225,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if success:
-        await message.reply_text(f"✅ Post created as Pending!\n\n{result}")
+        await query.message.reply_text(f"✅ Post created as Pending!\n\n{result}")
     else:
-        await message.reply_text(f"❌ Failed:\n{result}")
+        await query.message.reply_text(f"❌ Failed:\n{result}")
+
+    # Clear collected data after posting
+    context.user_data["collected_parts"] = []
 
 
 if __name__ == "__main__":
@@ -202,7 +238,8 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(category_selected, pattern=r"^cat_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(done_post, pattern=r"^done_post$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message))
 
     print("Bot is running...")
     app.run_polling()
